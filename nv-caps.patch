@@ -1,0 +1,43 @@
+--- ../nv-caps.c        2021-08-25 12:05:32.250134259 +0200
++++ kernel/nvidia/nv-caps.c     2021-08-25 09:35:33.067114767 +0200
+@@ -21,6 +21,7 @@
+ 
+ *******************************************************************************/
+ 
++#include "linux/version.h"
+ #include "nv-linux.h"
+ #include "nv-caps.h"
+ #include "nv-procfs.h"
+@@ -39,7 +40,9 @@
+ 
+ /* sys_close() or __close_fd() */
+ #include <linux/syscalls.h>
+-
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0))
++#include <linux/fdtable.h>
++#endif
+ #define NV_CAP_DRV_MINOR_COUNT 8192
+ 
+ /* Hash table with 512 buckets */
+@@ -586,13 +589,15 @@
+  * 2018-04-02 2ca2a09d6215 ("fs: add ksys_close() wrapper; remove in-kernel
+  *  calls to sys_close()")
+  */
+-#if NV_IS_EXPORT_SYMBOL_PRESENT___close_fd
+-    __close_fd(current->files, fd);
+-#else
+-    sys_close(fd);
+-#endif
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0))
++     close_fd(fd);
++ #elif NV_IS_EXPORT_SYMBOL_PRESENT___close_fd
++     __close_fd(current->files, fd);
++ #else
++     sys_close(fd);
++ #endif
+ 
+-    task_unlock(current);
++     task_unlock(current);
+ }
+ 
+ static nv_cap_t* nv_cap_alloc(nv_cap_t *parent_cap, const char *name)
