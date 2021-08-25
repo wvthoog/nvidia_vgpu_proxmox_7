@@ -1,0 +1,10 @@
+--- ../nvidia-vgpu-vfio.c       2021-08-25 12:05:32.250134259 +0200
++++ kernel/nvidia-vgpu-vfio/nvidia-vgpu-vfio.c  2021-08-25 09:38:05.447612551 +0200
+@@ -4174,6 +4174,6 @@
+ module_init(nv_vgpu_vfio_init);
+ module_exit(nv_vgpu_vfio_exit);
+ 
+-MODULE_LICENSE("MIT");
++MODULE_LICENSE("GPL");
+ MODULE_INFO(supported, "external");
+ MODULE_VERSION(NV_VERSION_STRING)
