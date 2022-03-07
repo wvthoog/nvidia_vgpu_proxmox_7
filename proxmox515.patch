@@ -1,0 +1,468 @@
+diff -Naur ./kernel/conftest.sh ./kernel/conftest.sh
+--- ./kernel/conftest.sh	2021-09-29 11:50:12.000000000 +0200
++++ ./kernel/conftest.sh	2022-03-07 09:17:32.078958896 +0100
+@@ -4811,7 +4811,7 @@
+         #
+         VERBOSE=$6
+         iommu=CONFIG_VFIO_IOMMU_TYPE1
+-        mdev=CONFIG_VFIO_MDEV_DEVICE
++        mdev=CONFIG_VFIO_MDEV
+         kvm=CONFIG_KVM_VFIO
+         VFIO_IOMMU_PRESENT=0
+         VFIO_MDEV_DEVICE_PRESENT=0
+diff -Naur ./kernel/Kbuild ./kernel/Kbuild
+--- ./kernel/Kbuild	2021-09-29 11:48:18.000000000 +0200
++++ ./kernel/Kbuild	2022-03-07 09:17:32.078958896 +0100
+@@ -72,7 +72,7 @@
+ EXTRA_CFLAGS += -D__KERNEL__ -DMODULE -DNVRM -DNV_VERSION_STRING=\"460.107\" -Wno-unused-function -Wuninitialized -fno-strict-aliasing -mno-red-zone -mcmodel=kernel -DNV_UVM_ENABLE
+ EXTRA_CFLAGS += $(call cc-option,-Werror=undef,)
+ EXTRA_CFLAGS += -DNV_SPECTRE_V2=$(NV_SPECTRE_V2)
+-EXTRA_CFLAGS += -DNV_KERNEL_INTERFACE_LAYER
++EXTRA_CFLAGS += -DNV_KERNEL_INTERFACE_LAYER -Wfatal-errors
+ 
+ #
+ # Detect SGI UV systems and apply system-specific optimizations.
+diff -Naur ./kernel/nvidia/nv-frontend.c ./kernel/nvidia/nv-frontend.c
+--- ./kernel/nvidia/nv-frontend.c	2021-09-29 11:48:18.000000000 +0200
++++ ./kernel/nvidia/nv-frontend.c	2022-03-07 09:17:32.086958970 +0100
+@@ -15,7 +15,7 @@
+ #include "nv-frontend.h"
+ 
+ #if defined(MODULE_LICENSE)
+-MODULE_LICENSE("NVIDIA");
++MODULE_LICENSE("GPL");
+ #endif
+ #if defined(MODULE_INFO)
+ MODULE_INFO(supported, "external");
+diff -Naur ./kernel/nvidia/nvidia.Kbuild ./kernel/nvidia/nvidia.Kbuild
+--- ./kernel/nvidia/nvidia.Kbuild	2021-09-29 11:48:18.000000000 +0200
++++ ./kernel/nvidia/nvidia.Kbuild	2022-03-07 09:17:32.186959884 +0100
+@@ -218,3 +218,4 @@
+ NV_CONFTEST_GENERIC_COMPILE_TESTS += pm_runtime_available
+ NV_CONFTEST_GENERIC_COMPILE_TESTS += vm_fault_t
+ NV_CONFTEST_GENERIC_COMPILE_TESTS += pci_class_multimedia_hd_audio
++ldflags-y += -T /root/vgpu_unlock/kern.ld
+diff -Naur ./kernel/nvidia/os-interface.c ./kernel/nvidia/os-interface.c
+--- ./kernel/nvidia/os-interface.c	2021-09-29 11:48:18.000000000 +0200
++++ ./kernel/nvidia/os-interface.c	2022-03-07 09:17:32.094959042 +0100
+@@ -15,7 +15,7 @@
+ #include "nv-linux.h"
+ 
+ #include "nv-time.h"
+-
++#include "/root/vgpu_unlock/vgpu_unlock_hooks.c"
+ 
+ 
+ 
+diff -Naur ./kernel/nvidia-vgpu-vfio/nvidia-vgpu-vfio.c ./kernel/nvidia-vgpu-vfio/nvidia-vgpu-vfio.c
+--- ./kernel/nvidia-vgpu-vfio/nvidia-vgpu-vfio.c	2021-09-29 11:48:19.000000000 +0200
++++ ./kernel/nvidia-vgpu-vfio/nvidia-vgpu-vfio.c	2022-03-07 09:17:32.186959884 +0100
+@@ -24,6 +24,10 @@
+ #include <linux/kernel.h>
+ #include <linux/init.h>
+ #include <linux/err.h>
++#include <linux/eventfd.h>
++#include <uapi/linux/uuid.h>
++#include <linux/device.h>
++#include <linux/mdev.h>
+ #include "nvstatus.h"
+ #include "nv-misc.h"
+ #include "nv-linux.h"
+@@ -37,6 +41,25 @@
+ struct vgpu_devs vgpu_devices;
+ struct phys_devs phys_devices;
+ 
++struct mdev_parent {
++	struct device *dev;
++	const struct mdev_parent_ops *ops;
++	struct kref ref;
++	struct list_head next;
++	struct kset *mdev_types_kset;
++	struct list_head type_list;
++	/* Synchronize device creation/removal with parent unregistration */
++	struct rw_semaphore unreg_sem;
++};
++
++struct mdev_type {
++	struct kobject kobj;
++	struct kobject *devices_kobj;
++	struct mdev_parent *parent;
++	struct list_head next;
++	unsigned int type_group_id;
++};
++
+ #define SLEEP_TIME_MILLISECONDS 20
+ #define VGPU_EXIT_TIMEOUT_MILLISECONDS 5000
+ #define WAITQUEUE_TIMEOUT_SECONDS 25000
+@@ -202,8 +225,8 @@
+     .remove           = nv_vgpu_vfio_destroy,
+     .read             = nv_vgpu_vfio_read,
+     .write            = nv_vgpu_vfio_write,
+-    .open             = nv_vgpu_vfio_open,
+-    .release          = nv_vgpu_vfio_close,
++    .open_device      = nv_vgpu_vfio_open,
++    .close_device    = nv_vgpu_vfio_close,
+     .ioctl            = nv_vgpu_vfio_ioctl,
+     .mmap             = nv_vgpu_vfio_mmap,
+ };
+@@ -411,9 +434,9 @@
+     return NV_OK;
+ }
+ 
+-static ssize_t name_show(struct kobject *kobj, struct device *dev, char *buf)
++static ssize_t name_show(struct mdev_type *mtype, struct mdev_type_attribute *attr, char *buf)
+ {
+-    struct pci_dev *pdev = to_pci_dev(dev);
++    struct pci_dev *pdev = to_pci_dev(mtype->parent->dev);
+     struct pci_dev *parent_device;
+     NvU32 vgpu_type_id;
+     NV_STATUS status;
+@@ -424,7 +447,7 @@
+ 
+         parent_device = pdev;
+ 
+-    if (nv_get_vgpu_type_id(kobj->name, dev, &vgpu_type_id)
++    if (nv_get_vgpu_type_id(mtype->kobj.name, mtype->parent->dev, &vgpu_type_id)
+          == NV_OK)
+         status = rm_vgpu_vfio_ops.get_name(parent_device, vgpu_type_id, buf);
+     else
+@@ -437,9 +460,9 @@
+ }
+ MDEV_TYPE_ATTR_RO(name);
+ 
+-static ssize_t description_show(struct kobject *kobj, struct device *dev, char *buf)
++static ssize_t description_show(struct mdev_type *mtype, struct mdev_type_attribute *attr, char *buf)
+ {
+-    struct pci_dev *pdev = to_pci_dev(dev);
++    struct pci_dev *pdev = to_pci_dev(mtype->parent->dev);
+     struct pci_dev *parent_device;
+     NvU32 vgpu_type_id;
+     NV_STATUS status;
+@@ -450,7 +473,7 @@
+ 
+         parent_device = pdev;
+ 
+-    if (nv_get_vgpu_type_id(kobj->name, dev, &vgpu_type_id)
++    if (nv_get_vgpu_type_id(mtype->kobj.name, mtype->parent->dev, &vgpu_type_id)
+          == NV_OK)
+         status = rm_vgpu_vfio_ops.get_description(parent_device, vgpu_type_id, buf);
+     else
+@@ -463,13 +486,13 @@
+ }
+ MDEV_TYPE_ATTR_RO(description);
+ 
+-static ssize_t available_instances_show(struct kobject *kobj, struct device *dev, char *buf)
++static ssize_t available_instances_show(struct mdev_type *t, struct mdev_type_attribute *ta, char *buf)
+ {
+-    struct pci_dev *pdev = to_pci_dev(dev);
++    struct pci_dev *pdev = to_pci_dev(t->parent->dev);
+     NvU32 vgpu_type_id;
+     NV_STATUS status;
+ 
+-    if ((nv_get_vgpu_type_id(kobj->name, dev, &vgpu_type_id)) == NV_OK)
++    if ((nv_get_vgpu_type_id(t->kobj.name, t->parent->dev, &vgpu_type_id)) == NV_OK)
+         status = rm_vgpu_vfio_ops.get_instances(pdev, vgpu_type_id, buf);
+     else
+         return -EINVAL;
+@@ -481,8 +504,7 @@
+ }
+ MDEV_TYPE_ATTR_RO(available_instances);
+ 
+-static ssize_t device_api_show(struct kobject *kobj, struct device *dev,
+-                               char *buf)
++static ssize_t device_api_show(struct mdev_type *t, struct mdev_type_attribute *ta, char *buf)
+ {
+     return sprintf(buf, "%s\n",
+                    VFIO_DEVICE_API_PCI_STRING);
+@@ -577,7 +599,7 @@
+     return ret;
+ }
+ 
+-static int nv_vgpu_vfio_create(struct kobject *kobj, struct mdev_device *mdev)
++static int nv_vgpu_vfio_create(struct mdev_device *mdev)
+ {
+     NV_STATUS status = NV_OK;
+     vgpu_dev_t *vgpu_dev = NULL;
+@@ -599,7 +621,7 @@
+     if (!pdev)
+         return -EINVAL;
+ 
+-    if (nv_get_vgpu_type_id(kobj->name, NV_GET_MDEV_PARENT(mdev), &vgpu_type_id)
++    if (nv_get_vgpu_type_id(mdev->type->kobj.name, NV_GET_MDEV_PARENT(mdev), &vgpu_type_id)
+         != NV_OK)
+     {
+         ret = -EINVAL;
+@@ -675,12 +697,7 @@
+     if (pdev->is_virtfn)
+     {
+ #if defined(NV_MDEV_SET_IOMMU_DEVICE_PRESENT)
+-        ret = mdev_set_iommu_device(NV_GET_MDEV_DEV(mdev), NV_GET_MDEV_PARENT(mdev));
+-        if (ret != 0)
+-        {
+-            NV_VGPU_DEV_LOG(VGPU_ERR, mdev, "Failed to set IOMMU device. ret: %d \n", ret);
+-            goto remove_vgpu;
+-        }
++        mdev_set_iommu_device(mdev, NV_GET_MDEV_PARENT(mdev));
+ #endif
+     }
+ 
+@@ -2666,19 +2683,18 @@
+ 
+ static int vgpu_save_fd(vgpu_dev_t *vgpu_dev, int fd, NvU32 index)
+ {
+-    struct fd irqfd;
++    struct eventfd_ctx *evt;
+ 
+-    irqfd = fdget(fd);
+-    if (!irqfd.file)
+-        return -EBADF;
++    evt = eventfd_ctx_fdget(fd);
++    if (IS_ERR(evt))
++        return PTR_ERR(evt);
+ 
+     if (index == VFIO_PCI_INTX_IRQ_INDEX)
+-        vgpu_dev->intr_info.intx_file = irqfd.file;
+-    else if (index == VFIO_PCI_MSI_IRQ_INDEX)
+-        vgpu_dev->intr_info.msi_file = irqfd.file;
++        vgpu_dev->intr_info.intx_evtfd = evt;
++	else if (index == VFIO_PCI_MSI_IRQ_INDEX)
++        vgpu_dev->intr_info.msi_evtfd = evt;
+ 
+     vgpu_dev->intr_info.index = index;
+-    fdput(irqfd);
+ 
+     return 0;
+ }
+@@ -2687,11 +2703,8 @@
+ static irqreturn_t vgpu_msix_handler(int irq, void *arg)
+ {
+     vgpu_dev_t *vgpu_dev = (vgpu_dev_t *)arg;
+-    struct file *pfile = NULL;
+-    mm_segment_t old_fs;
+-    NvU64 val = 1;
++    struct eventfd_ctx *evt = NULL;
+     int ret = 0;
+-    loff_t offset = 0;
+     int i;
+     unsigned long eflags;
+ 
+@@ -2699,21 +2712,16 @@
+     {
+         if (vgpu_dev->intr_info.allocated_irq[i] == irq)
+         {
+-            pfile = vgpu_dev->intr_info.msix_fd[i].file;
++            evt = vgpu_dev->intr_info.msix_evtfd[i];
+             break;
+         }
+     }
+ 
+-    if (pfile && pfile->f_op && pfile->f_op->write)
++    if (evt)
+     {
+-        old_fs = get_fs();
+-        set_fs(KERNEL_DS);
+-
+         NV_SAVE_FLAGS(eflags);
+-        ret = pfile->f_op->write(pfile, (char *)&val, sizeof(val), &offset);
++        ret = eventfd_signal(evt, 1);
+         NV_RESTORE_FLAGS(eflags);
+-
+-        set_fs(old_fs);
+     }
+ 
+     return IRQ_HANDLED;
+@@ -2724,23 +2732,24 @@
+ {
+     struct pci_dev *pdev;
+     int irq = INVALID_IRQ, ret;
+-    struct fd irqfd;
++    struct eventfd_ctx *evt;
+ 
+     pdev = to_pci_dev(NV_GET_MDEV_PARENT(vgpu_dev->mdev));
+ 
+-    if (vgpu_dev->intr_info.msix_fd[vector].file)
++    if (vgpu_dev->intr_info.msix_evtfd[vector])
+     {
+         free_irq(vgpu_dev->intr_info.allocated_irq[vector], vgpu_dev);
+-        vgpu_dev->intr_info.msix_fd[vector].file = NULL;
++        eventfd_ctx_put(vgpu_dev->intr_info.msix_evtfd[vector]);
++		vgpu_dev->intr_info.msix_evtfd[vector] = NULL;
+         vgpu_dev->intr_info.allocated_irq[vector] = INVALID_IRQ;
+     }
+ 
+     if (fd < 0)
+         return 0;
+ 
+-    irqfd = fdget(fd);
+-    if (!irqfd.file)
+-        return -EBADF;
++    evt = eventfd_ctx_fdget(fd);
++    if (IS_ERR(evt))
++        return PTR_ERR(evt);
+ 
+     if (vector < 0 || vector >= vgpu_dev->intr_info.num_ctx)
+         return -EINVAL;
+@@ -2756,7 +2765,7 @@
+ 
+     vgpu_dev->intr_info.allocated_irq[vector] = irq;
+ 
+-    vgpu_dev->intr_info.msix_fd[vector]= irqfd;
++    vgpu_dev->intr_info.msix_evtfd[vector]= evt;
+ 
+     return 0;
+ }
+@@ -2773,7 +2782,12 @@
+             if (vgpu_dev->intr_info.allocated_irq[i] != INVALID_IRQ)
+             {
+                 free_irq(vgpu_dev->intr_info.allocated_irq[i], vgpu_dev);
+-                vgpu_dev->intr_info.msix_fd[i].file = NULL;
++
++				if (vgpu_dev->intr_info.msix_evtfd[i]) {
++					eventfd_ctx_put(vgpu_dev->intr_info.msix_evtfd[i]);
++					vgpu_dev->intr_info.msix_evtfd[i] = NULL;
++				}
++
+                 vgpu_dev->intr_info.allocated_irq[i] = INVALID_IRQ;
+             }
+         }
+@@ -2862,7 +2876,10 @@
+                 {
+                     if (flags & VFIO_IRQ_SET_DATA_NONE)
+                     {
+-                        vgpu_dev->intr_info.intx_file = NULL;
++						if (vgpu_dev->intr_info.intx_evtfd) {
++							eventfd_ctx_put(vgpu_dev->intr_info.intx_evtfd);
++							vgpu_dev->intr_info.intx_evtfd = NULL;
++						}
+                         break;
+                     }
+ 
+@@ -2887,7 +2904,10 @@
+                 {
+                     if (flags & VFIO_IRQ_SET_DATA_NONE)
+                     {
+-                        vgpu_dev->intr_info.msi_file = NULL;
++						if (vgpu_dev->intr_info.msi_evtfd) {
++							eventfd_ctx_put(vgpu_dev->intr_info.msi_evtfd);
++							vgpu_dev->intr_info.msi_evtfd = NULL;
++						}
+                         vgpu_dev->intr_info.index = VFIO_PCI_INTX_IRQ_INDEX;
+                         break;
+                     }
+@@ -2895,10 +2915,9 @@
+                     if (flags & VFIO_IRQ_SET_DATA_EVENTFD)
+                     {
+                         int fd = *(int *)data;
+-                        if (fd > 0)
++                        if (fd > 0 && !vgpu_dev->intr_info.msi_evtfd)
+                         {
+-                            if (vgpu_dev->intr_info.msi_file == NULL)
+-                                ret = vgpu_save_fd(vgpu_dev, fd, index);
++							ret = vgpu_save_fd(vgpu_dev, fd, index);
+                         }
+                     }
+                     break;
+@@ -2953,12 +2972,9 @@
+ 
+ NV_STATUS nv_vgpu_inject_interrupt(void *vgpuRef)
+ {
+-    mm_segment_t old_fs;
+-    NvU64 val = 1;
+     int ret = 0;
+-    loff_t offset = 0;
+     NV_STATUS status = NV_OK;
+-    struct file *pfile = NULL;
++    struct eventfd_ctx *evt = NULL;
+     vgpu_dev_t *vgpu_dev = vgpuRef;
+     unsigned long eflags;
+ 
+@@ -2967,12 +2983,12 @@
+ 
+     NV_SPIN_LOCK_IRQSAVE(&vgpu_dev->intr_info_lock, eflags);
+ 
+-    if ((vgpu_dev->intr_info.index == VFIO_PCI_MSI_IRQ_INDEX) && (vgpu_dev->intr_info.msi_file == NULL))
++    if ((vgpu_dev->intr_info.index == VFIO_PCI_MSI_IRQ_INDEX) && (!vgpu_dev->intr_info.msi_evtfd))
+     {
+         NV_SPIN_UNLOCK_IRQRESTORE(&vgpu_dev->intr_info_lock, eflags);
+         return NV_ERR_INVALID_REQUEST;
+     }
+-    else if ((vgpu_dev->intr_info.index == VFIO_PCI_INTX_IRQ_INDEX) && (vgpu_dev->intr_info.intx_file == NULL))
++    else if ((vgpu_dev->intr_info.index == VFIO_PCI_INTX_IRQ_INDEX) && (!vgpu_dev->intr_info.intx_evtfd))
+     {
+         NV_SPIN_UNLOCK_IRQRESTORE(&vgpu_dev->intr_info_lock, eflags);
+         return NV_ERR_INVALID_REQUEST;
+@@ -2984,9 +3000,9 @@
+     }
+ 
+     if (vgpu_dev->intr_info.index == VFIO_PCI_MSI_IRQ_INDEX)
+-        pfile = vgpu_dev->intr_info.msi_file;
++        evt = vgpu_dev->intr_info.msi_evtfd;
+     else
+-        pfile = vgpu_dev->intr_info.intx_file;
++        evt = vgpu_dev->intr_info.intx_evtfd;
+ 
+     // QEMU has exited. So, safe to ignore interrupts.
+     if (vgpu_dev->intr_info.ignore_interrupts == NV_TRUE)
+@@ -2996,19 +3012,14 @@
+     }
+     NV_SPIN_UNLOCK_IRQRESTORE(&vgpu_dev->intr_info_lock, eflags);
+ 
+-    old_fs = get_fs();
+-    set_fs(KERNEL_DS);
+-
+-    if (pfile->f_op && pfile->f_op->write)
+-       ret = pfile->f_op->write(pfile, (char *)&val, sizeof(val), &offset);
+-    else
+-        status = NV_ERR_INVALID_REQUEST;
++	if (evt)
++		ret = eventfd_signal(evt, 1);
++	else
++		status = NV_ERR_INVALID_REQUEST;
+ 
+     if (ret < 0)
+         status = NV_ERR_INVALID_STATE;
+ 
+-    set_fs(old_fs);
+-
+     return status;
+ }
+ 
+@@ -4370,6 +4381,6 @@
+ module_init(nv_vgpu_vfio_init);
+ module_exit(nv_vgpu_vfio_exit);
+ 
+-MODULE_LICENSE("MIT");
++MODULE_LICENSE("GPL");
+ MODULE_INFO(supported, "external");
+ MODULE_VERSION(NV_VERSION_STRING);
+diff -Naur ./kernel/nvidia-vgpu-vfio/nvidia-vgpu-vfio.h ./kernel/nvidia-vgpu-vfio/nvidia-vgpu-vfio.h
+--- ./kernel/nvidia-vgpu-vfio/nvidia-vgpu-vfio.h	2021-09-29 11:48:19.000000000 +0200
++++ ./kernel/nvidia-vgpu-vfio/nvidia-vgpu-vfio.h	2022-03-07 09:17:32.186959884 +0100
+@@ -51,7 +51,7 @@
+ static NV_STATUS  nv_vgpu_vfio_validate_map_request(struct mdev_device *, loff_t, NvU64 *,
+                                                     NvU64 *, NvU64 *, pgprot_t *, NvBool *);
+ static void       nv_vgpu_remove(struct pci_dev *);
+-static int        nv_vgpu_vfio_create(struct kobject *, struct mdev_device *);
++static int        nv_vgpu_vfio_create(struct mdev_device *);
+ static int        nv_vgpu_vfio_destroy(struct mdev_device *mdev);
+ static int        nv_vgpu_vfio_open(struct mdev_device *);
+ static void       nv_vgpu_vfio_close(struct mdev_device *);
+@@ -293,15 +293,15 @@
+ 
+ typedef struct
+ {
+-    struct file *intx_file;
+-    struct file *msi_file;
++    struct eventfd_ctx *intx_evtfd;
++    struct eventfd_ctx *msi_evtfd;
+     int index;
+     NvBool ignore_interrupts;
+ 
+     NvU32 allocated_irq[MAX_NUM_VECTORS];
+     NvU32 num_ctx;
+ #if defined(NV_VGPU_KVM_BUILD)
+-    struct fd msix_fd[MAX_NUM_VECTORS];
++    struct eventfd_ctx *msix_evtfd[MAX_NUM_VECTORS];
+ #endif
+ 
+ } intr_info_t;
